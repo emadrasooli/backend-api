@@ -60,7 +60,6 @@ jobs:
             type=raw,value=latest
 
       - name: Build and push Docker image
-        id: build
         uses: docker/build-push-action@v5
         with:
           context: .
@@ -70,22 +69,19 @@ jobs:
 
       - name: Update image tag in infra-code repo
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          INFRA_CODE_TOKEN: ${{ secrets.INFRA_CODE_TOKEN }}
         run: |
-          # Get the short SHA of this commit
           SHORT_SHA=$(echo "${{ github.sha }}" | cut -c1-7)
           IMAGE_TAG="${SHORT_SHA}"
 
           echo "Updating infra-code with image tag: ${IMAGE_TAG}"
 
-          # Clone infra-code repo
-          git clone https://x-access-token:${GH_TOKEN}@github.com/${{ github.repository_owner }}/infra-code.git
+          git clone https://x-access-token:${INFRA_CODE_TOKEN}@github.com/emadrasooli/infra-code.git
           cd infra-code
 
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
 
-          # Update the dev overlay image tag
           cd apps/backend/overlays/dev
           sed -i "s|newTag:.*|newTag: ${IMAGE_TAG}|" kustomization.yaml
 
@@ -93,8 +89,7 @@ jobs:
           git add apps/backend/overlays/dev/kustomization.yaml
           git commit -m "ci: update backend-api image tag to ${IMAGE_TAG}
 
-          Triggered by commit ${{ github.sha }}
-          Workflow: ${{ github.workflow }}"
+          Triggered by: ${{ github.sha }}"
 
           git push origin main
           echo "✅ infra-code updated with tag ${IMAGE_TAG}"

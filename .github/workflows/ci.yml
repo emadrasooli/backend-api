@@ -43,6 +43,13 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Generate image tag
+        id: tag
+        run: |
+          IMAGE_TAG=$(date -u '+%Y%m%d-%H%M')
+          echo "IMAGE_TAG=${IMAGE_TAG}" >> $GITHUB_OUTPUT
+          echo "Tag: ${IMAGE_TAG}"
+
       - name: Log in to GitHub Container Registry
         uses: docker/login-action@v3
         with:
@@ -56,7 +63,7 @@ jobs:
         with:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
           tags: |
-            type=sha,prefix=,format=short
+            type=raw,value=${{ steps.tag.outputs.IMAGE_TAG }}
             type=raw,value=latest
 
       - name: Build and push Docker image
@@ -71,9 +78,7 @@ jobs:
         env:
           INFRA_CODE_TOKEN: ${{ secrets.INFRA_CODE_TOKEN }}
         run: |
-          SHORT_SHA=$(echo "${{ github.sha }}" | cut -c1-7)
-          IMAGE_TAG="${SHORT_SHA}"
-
+          IMAGE_TAG="${{ steps.tag.outputs.IMAGE_TAG }}"
           echo "Updating infra-code with image tag: ${IMAGE_TAG}"
 
           git clone https://x-access-token:${INFRA_CODE_TOKEN}@github.com/emadrasooli/infra-code.git

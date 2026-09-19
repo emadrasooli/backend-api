@@ -1,18 +1,30 @@
-name: CI — Build and Push Backend
+name: CI — Backend Delivery Pipeline
 
 on:
   push:
-    branches: [main]
+    branches:
+      - main
   pull_request:
-    branches: [main]
+    branches:
+      - main
+      - qa
+      - staging
+      - release
+    types:
+      - opened
+      - synchronize
+      - reopened
+      - closed
 
-env:
-  REGISTRY: ghcr.io
-  IMAGE_NAME: ${{ github.repository_owner }}/backend-api
+permissions:
+  contents: read
+  packages: write
 
 jobs:
   test:
+    name: Test
     runs-on: ubuntu-latest
+    if: github.event_name == 'push' || (github.event_name == 'pull_request' && github.event.action != 'closed')
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -31,70 +43,209 @@ jobs:
         run: |
           python -c "from app.main import app; print('✅ App imports OK')"
 
-  build-and-push:
+  build-main:
+    name: Build Main Image & Deploy Dev
     runs-on: ubuntu-latest
     needs: test
-    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
-    permissions:
-      contents: write
-      packages: write
-
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
 
-      - name: Generate image tag
+      - name: Generate immutable release tag
         id: tag
         run: |
-          IMAGE_TAG=$(date -u '+%Y%m%d-%H%M')
+          SOURCE_SHA="${{ github.sha }}"
+          SHORT_SHA="${SOURCE_SHA:0:7}"
+          TIMESTAMP=$(date -u '+%Y%m%d-%H%M')
+          IMAGE_TAG="v${TIMESTAMP}-${SHORT_SHA}"
+
+          TAG_REGEX='^v[0-9]{8}-[0-9]{4}-[0-9a-f]{7}$'
+          if [[ ! "$IMAGE_TAG" =~ $TAG_REGEX ]]; then
+            echo "::error::Generated tag '$IMAGE_TAG' does not match regex $TAG_REGEX"
+            exit 1
+          fi
+
           echo "IMAGE_TAG=${IMAGE_TAG}" >> $GITHUB_OUTPUT
-          echo "Tag: ${IMAGE_TAG}"
+          echo "SHORT_SHA=${SHORT_SHA}" >> $GITHUB_OUTPUT
+          echo "Generated immutable release tag: ${IMAGE_TAG}"
 
       - name: Log in to GitHub Container Registry
         uses: docker/login-action@v3
         with:
-          registry: ${{ env.REGISTRY }}
+          registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Extract metadata
-        id: meta
-        uses: docker/metadata-action@v5
-        with:
-          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
-          tags: |
-            type=raw,value=${{ steps.tag.outputs.IMAGE_TAG }}
-            type=raw,value=latest
-
       - name: Build and push Docker image
+        id: docker_build
         uses: docker/build-push-action@v5
         with:
           context: .
           push: true
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
+          tags: ghcr.io/${{ github.repository_owner }}/backend-api:${{ steps.tag.outputs.IMAGE_TAG }}
 
-      - name: Update image tag in infra-code repo
+      - name: Record image digest
+        run: |
+          echo "Published Image: ghcr.io/${{ github.repository_owner }}/backend-api:${{ steps.tag.outputs.IMAGE_TAG }}"
+          echo "Image Digest:    ${{ steps.docker_build.outputs.digest }}"
+
+      - name: Dispatch image-built to infra-code (dev)
         env:
           INFRA_CODE_TOKEN: ${{ secrets.INFRA_CODE_TOKEN }}
+          IMAGE_TAG: ${{ steps.tag.outputs.IMAGE_TAG }}
+          SOURCE_SHA: ${{ github.sha }}
         run: |
-          IMAGE_TAG="${{ steps.tag.outputs.IMAGE_TAG }}"
-          echo "Updating infra-code with image tag: ${IMAGE_TAG}"
+          PAYLOAD=$(jq -n \
+            --arg comp "backend" \
+            --arg env "dev" \
+            --arg tag "$IMAGE_TAG" \
+            --arg sha "$SOURCE_SHA" \
+            '{event_type: "image-built", client_payload: {component: $comp, environment: $env, image_tag: $tag, source_sha: $sha}}')
 
-          git clone https://x-access-token:${INFRA_CODE_TOKEN}@github.com/emadrasooli/infra-code.git
-          cd infra-code
+          echo "Dispatching image-built to infra-code repository..."
+          curl --fail-with-body -sS -X POST \
+            -H "Accept: application/vnd.github+json" \
+            -H "Authorization: Bearer $INFRA_CODE_TOKEN" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            https://api.github.com/repos/emadrasooli/infra-code/dispatches \
+            -d "$PAYLOAD"
+          echo "Successfully dispatched image-built for dev."
 
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
+  promote:
+    name: Promote Existing Artifact
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request' && github.event.action == 'closed' && github.event.pull_request.merged == true
+    steps:
+      - name: Evaluate promotion path and dispatch
+        env:
+          INFRA_CODE_TOKEN: ${{ secrets.INFRA_CODE_TOKEN }}
+          HEAD_REF: ${{ github.event.pull_request.head.ref }}
+          BASE_REF: ${{ github.event.pull_request.base.ref }}
+          SOURCE_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
 
-          cd apps/backend/overlays/dev
-          sed -i "s|newTag:.*|newTag: ${IMAGE_TAG}|" kustomization.yaml
+          echo "Evaluating promotion for merged PR: $HEAD_REF -> $BASE_REF"
 
-          cd ../../../../
-          git add apps/backend/overlays/dev/kustomization.yaml
-          git commit -m "ci: update backend-api image tag to ${IMAGE_TAG}
+          case "$HEAD_REF:$BASE_REF" in
+            main:qa)
+              SOURCE_ENV="dev"
+              TARGET_ENV="qa"
+              ;;
+            qa:staging)
+              SOURCE_ENV="qa"
+              TARGET_ENV="staging"
+              ;;
+            staging:release)
+              SOURCE_ENV="staging"
+              TARGET_ENV="prod"
+              ;;
+            *)
+              echo "Branch pair $HEAD_REF -> $BASE_REF is not a normal promotion path. Skipping promotion dispatch."
+              exit 0
+              ;;
+          esac
 
-          Triggered by: ${{ github.sha }}"
+          echo "Promoting backend image: $SOURCE_ENV -> $TARGET_ENV (source commit: $SOURCE_SHA)"
 
-          git push origin main
-          echo "✅ infra-code updated with tag ${IMAGE_TAG}"
+          PAYLOAD=$(jq -n \
+            --arg comp "backend" \
+            --arg src "$SOURCE_ENV" \
+            --arg tgt "$TARGET_ENV" \
+            --arg sha "$SOURCE_SHA" \
+            '{event_type: "image-promote", client_payload: {component: $comp, source_environment: $src, target_environment: $tgt, source_sha: $sha}}')
+
+          curl --fail-with-body -sS -X POST \
+            -H "Accept: application/vnd.github+json" \
+            -H "Authorization: Bearer $INFRA_CODE_TOKEN" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            https://api.github.com/repos/emadrasooli/infra-code/dispatches \
+            -d "$PAYLOAD"
+          echo "Successfully dispatched image-promote ($SOURCE_ENV -> $TARGET_ENV)."
+
+  build-hotfix-prod:
+    name: Build Hotfix & Deploy Prod
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request' && github.event.action == 'closed' && github.event.pull_request.merged == true && github.event.pull_request.base.ref == 'release' && startsWith(github.event.pull_request.head.ref, 'hotfix/')
+    steps:
+      - name: Checkout merged release code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run test on merged code
+        run: |
+          python -c "from app.main import app; print('✅ App imports OK')"
+
+      - name: Generate immutable hotfix release tag
+        id: tag
+        run: |
+          SOURCE_SHA="${{ github.sha }}"
+          SHORT_SHA="${SOURCE_SHA:0:7}"
+          TIMESTAMP=$(date -u '+%Y%m%d-%H%M')
+          IMAGE_TAG="v${TIMESTAMP}-${SHORT_SHA}"
+
+          TAG_REGEX='^v[0-9]{8}-[0-9]{4}-[0-9a-f]{7}$'
+          if [[ ! "$IMAGE_TAG" =~ $TAG_REGEX ]]; then
+            echo "::error::Generated hotfix tag '$IMAGE_TAG' does not match regex $TAG_REGEX"
+            exit 1
+          fi
+
+          echo "IMAGE_TAG=${IMAGE_TAG}" >> $GITHUB_OUTPUT
+          echo "SHORT_SHA=${SHORT_SHA}" >> $GITHUB_OUTPUT
+          echo "Generated immutable hotfix tag: ${IMAGE_TAG}"
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push Docker image
+        id: docker_build
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: true
+          tags: ghcr.io/${{ github.repository_owner }}/backend-api:${{ steps.tag.outputs.IMAGE_TAG }}
+
+      - name: Record image digest
+        run: |
+          echo "Published Hotfix Image: ghcr.io/${{ github.repository_owner }}/backend-api:${{ steps.tag.outputs.IMAGE_TAG }}"
+          echo "Image Digest:           ${{ steps.docker_build.outputs.digest }}"
+
+      - name: Dispatch image-built to infra-code (prod)
+        env:
+          INFRA_CODE_TOKEN: ${{ secrets.INFRA_CODE_TOKEN }}
+          IMAGE_TAG: ${{ steps.tag.outputs.IMAGE_TAG }}
+          SOURCE_SHA: ${{ github.sha }}
+        run: |
+          PAYLOAD=$(jq -n \
+            --arg comp "backend" \
+            --arg env "prod" \
+            --arg tag "$IMAGE_TAG" \
+            --arg sha "$SOURCE_SHA" \
+            '{event_type: "image-built", client_payload: {component: $comp, environment: $env, image_tag: $tag, source_sha: $sha}}')
+
+          echo "Dispatching hotfix image-built to infra-code for prod..."
+          curl --fail-with-body -sS -X POST \
+            -H "Accept: application/vnd.github+json" \
+            -H "Authorization: Bearer $INFRA_CODE_TOKEN" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            https://api.github.com/repos/emadrasooli/infra-code/dispatches \
+            -d "$PAYLOAD"
+          echo "Successfully dispatched hotfix image-built for prod."
